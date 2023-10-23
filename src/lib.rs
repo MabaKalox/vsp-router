@@ -1,16 +1,19 @@
+use bytes::Bytes;
 use camino::{Utf8Path, Utf8PathBuf};
-use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-#[cfg(unix)]
-use tokio_serial::SerialPort;
-use tokio_serial::SerialPortBuilderExt;
-use tokio_serial::SerialStream;
-use tokio_stream::{StreamExt, StreamMap};
-use tokio_util::io::ReaderStream;
-use tracing::{error, info};
-
-use std::collections::HashMap;
+use futures_util::future::BoxFuture;
+use futures_util::StreamExt;
 use std::fs;
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    sync::broadcast,
+    sync::broadcast::error::RecvError,
+    sync::Mutex,
+};
+use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialStream};
+use tokio_util::io::ReaderStream;
+use tracing::error;
 
 #[cfg(unix)]
 use std::os::unix;
@@ -93,30 +96,60 @@ impl Drop for PtyLink {
     }
 }
 
-#[tracing::instrument(skip_all)]
-pub async fn transfer<R, W>(
-    mut sources: StreamMap<String, ReaderStream<R>>,
-    mut sinks: HashMap<String, W>,
-    routes: HashMap<String, Vec<String>>,
-) -> Result<()>
+pub fn handle_send<W>(
+    mut receiver: broadcast::Receiver<Bytes>,
+    sink: Arc<Sink<W>>,
+) -> BoxFuture<'static, Result<()>>
 where
-    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    Box::pin(async move {
+        loop {
+            let packet = match receiver.recv().await {
+                Ok(bytes) => bytes,
+                Err(RecvError::Lagged(n)) => {
+                    format!("\n...Dropped {} packets of bytes...\n", n).into()
+                }
+                Err(RecvError::Closed) => break,
+            };
+
+            sink.send(packet).await?;
+        }
+        Ok(())
+    })
+}
+
+pub fn handle_receive<R>(
+    mut r: ReaderStream<R>,
+    sender: broadcast::Sender<Bytes>,
+) -> BoxFuture<'static, Result<()>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    Box::pin(async move {
+        while let Some(result) = r.next().await {
+            let bytes = result.map_err(Error::Read)?;
+            let _ = sender.send(bytes);
+        }
+
+        Ok(())
+    })
+}
+
+pub struct Sink<W>(Mutex<W>);
+
+impl<W> Sink<W>
+where
     W: AsyncWrite + Unpin,
 {
-    while let Some((src_id, result)) = sources.next().await {
-        if let Some(dst_ids) = routes.get(&src_id) {
-            let bytes = result.map_err(Error::Read)?;
-            info!(?src_id, ?dst_ids, ?bytes, "read");
-            for dst_id in dst_ids {
-                // This unwrap is OK as long as we validate all route IDs exist first
-                // Route IDs are validated in Args::check_route_ids()
-                let dst = sinks.get_mut(dst_id).unwrap();
-                let mut buf = bytes.clone();
-                dst.write_all_buf(&mut buf).await.map_err(Error::Write)?;
-                info!(?dst_id, ?bytes, "wrote");
-            }
-        }
+    pub fn new(w: W) -> Self {
+        Self(Mutex::new(w))
     }
 
-    Ok(())
+    pub async fn send(&self, data: Bytes) -> Result<()> {
+        let mut guard = self.0.lock().await;
+        guard.write_all(&data).await.map_err(Error::Write)?;
+        guard.flush().await.map_err(Error::Write)?;
+        Ok(())
+    }
 }
